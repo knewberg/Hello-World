@@ -1,0 +1,29 @@
+name: NCAA Volleyball Sweep Analysis
+on:
+  workflow_dispatch:
+  push:
+    branches: [sweep-analysis-2023-2025]
+    paths:
+      - 'sweep_analysis.py'
+      - '.github/workflows/sweep-analysis.yml'
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sweep-analysis-2023-2025
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pandas numpy scipy scikit-learn matplotlib
+      - run: python sweep_analysis.py
+      - name: Commit outputs
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add sweep_output
+          git diff --cached --quiet || git commit -m 'Run 2023-2025 sweep analysis'
+          git push origin HEAD:sweep-analysis-2023-2025
