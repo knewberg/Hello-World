@@ -11,7 +11,7 @@ permissions:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,10 +21,18 @@ jobs:
           python-version: '3.12'
       - run: pip install pandas numpy scipy scikit-learn matplotlib statsmodels
       - run: python sweep_analysis.py
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-analysis-2023-2025
+          path: sweep_output/
+          if-no-files-found: error
+          retention-days: 7
       - name: Commit outputs
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add sweep_output
           git diff --cached --quiet || git commit -m 'Run 2023-2025 sweep analysis'
+          git pull --rebase origin sweep-analysis-2023-2025
           git push origin HEAD:sweep-analysis-2023-2025
