@@ -13,17 +13,18 @@ permissions:
 jobs:
   rosters:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install parser dependencies
+      - name: Install browser and parser dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pandas requests beautifulsoup4 lxml
+          python -m pip install pandas pyreadr playwright
+          python -m playwright install --with-deps chromium
 
       - name: Materialize official NCAA Division I women's volleyball rosters
         shell: bash
@@ -31,173 +32,268 @@ jobs:
           cat > roster_scrape.py <<'PY'
           from __future__ import annotations
 
-          import concurrent.futures
+          import asyncio
           import hashlib
-          import io
           import json
           import random
           import re
-          import threading
-          import time
           from pathlib import Path
+          from typing import Any
 
           import pandas as pd
-          import requests
-          from bs4 import BeautifulSoup
+          import pyreadr
+          from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
-          YEARS = (2023, 2024, 2025, 2026)
+          HISTORICAL_YEARS = (2023, 2024, 2025)
+          OPTIONAL_CURRENT_YEAR = 2026
           OUTPUT = Path('rosters')
           OUTPUT.mkdir(parents=True, exist_ok=True)
+          DATA_BASE = 'https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main'
           USER_AGENT = (
-              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/126 Safari/537.36 '
-              'NCAA-WVB-research/1.0'
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/126.0.0.0 Safari/537.36'
           )
-          local = threading.local()
 
-          def session() -> requests.Session:
-              if not hasattr(local, 'session'):
-                  s = requests.Session()
-                  s.headers.update({'User-Agent': USER_AGENT, 'Accept': 'text/html,application/xhtml+xml'})
-                  local.session = s
-              return local.session
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
 
-          def get(url: str, attempts: int = 6) -> requests.Response:
-              last = None
-              for attempt in range(1, attempts + 1):
-                  try:
-                      response = session().get(url, timeout=(30, 90), allow_redirects=True)
-                      if response.status_code == 200 and len(response.content) > 100:
-                          return response
-                      last = RuntimeError(f'HTTP {response.status_code}, {len(response.content)} bytes')
-                  except Exception as exc:  # noqa: BLE001
-                      last = exc
-                  time.sleep(min(2 ** attempt, 25) + random.random())
-              raise RuntimeError(f'GET failed after {attempts} attempts: {url}: {last}')
+          async def browser_download(page: Page, url: str, destination: Path) -> None:
+              response = await page.request.get(url, timeout=120_000)
+              if not response.ok:
+                  raise RuntimeError(f'HTTP {response.status} for {url}')
+              destination.write_bytes(await response.body())
 
-          def team_list(year: int) -> tuple[pd.DataFrame, str]:
+          async def load_team_ids(context: BrowserContext) -> tuple[dict[int, pd.DataFrame], dict[str, Any]]:
+              page = await context.new_page()
+              audit: dict[str, Any] = {}
+              try:
+                  rda_path = OUTPUT / 'wvb_teams.rda'
+                  csv_2025 = OUTPUT / 'wvb_playerseason_div1_2025.csv'
+                  await browser_download(page, f'{DATA_BASE}/data/wvb_teams.rda', rda_path)
+                  await browser_download(page, f'{DATA_BASE}/data-csv/wvb_playerseason_div1_2025.csv', csv_2025)
+
+                  objects = pyreadr.read_r(rda_path)
+                  if not objects:
+                      raise RuntimeError('wvb_teams.rda contained no data frames')
+                  teams = next(iter(objects.values())).copy()
+                  teams.columns = [str(c).strip() for c in teams.columns]
+                  needed = {'team_id', 'team_name', 'yr'}
+                  if not needed.issubset(teams.columns):
+                      raise RuntimeError(f'wvb_teams.rda missing {sorted(needed - set(teams.columns))}: {list(teams.columns)}')
+
+                  out: dict[int, pd.DataFrame] = {}
+                  for year in (2023, 2024):
+                      subset = teams[pd.to_numeric(teams['yr'], errors='coerce').eq(year)][['team_id', 'team_name']].copy()
+                      subset['team_id'] = pd.to_numeric(subset['team_id'], errors='coerce').astype('Int64').astype(str)
+                      subset['team_name'] = subset['team_name'].astype(str).str.strip()
+                      subset = subset[subset['team_id'].str.fullmatch(r'\d+') & subset['team_name'].ne('')].drop_duplicates('team_id')
+                      subset.insert(0, 'season', year)
+                      out[year] = subset.sort_values(['team_name', 'team_id']).reset_index(drop=True)
+
+                  ps25 = pd.read_csv(csv_2025, low_memory=False)
+                  subset = ps25[['TeamID', 'Team']].dropna().drop_duplicates().copy()
+                  subset.columns = ['team_id', 'team_name']
+                  subset['team_id'] = pd.to_numeric(subset['team_id'], errors='coerce').astype('Int64').astype(str)
+                  subset['team_name'] = subset['team_name'].astype(str).str.strip()
+                  subset = subset[subset['team_id'].str.fullmatch(r'\d+') & subset['team_name'].ne('')].drop_duplicates('team_id')
+                  subset.insert(0, 'season', 2025)
+                  out[2025] = subset.sort_values(['team_name', 'team_id']).reset_index(drop=True)
+
+                  for year, frame in out.items():
+                      if len(frame) < 300:
+                          raise RuntimeError(f'Only {len(frame)} Division I team IDs recovered for {year}')
+                      path = OUTPUT / f'team_ids_{year}.csv'
+                      frame.to_csv(path, index=False)
+                      audit[str(year)] = {'teams': len(frame), 'source': 'wvb_teams.rda' if year < 2025 else 'wvb_playerseason_div1_2025.csv', 'sha256': sha256(path)}
+                  return out, audit
+              finally:
+                  await page.close()
+
+          async def discover_current_team_ids(context: BrowserContext) -> tuple[pd.DataFrame, dict[str, Any]]:
               url = (
                   'https://stats.ncaa.org/team/inst_team_list'
-                  f'?academic_year={year + 1}&conf_id=-1&division=1&sport_code=WVB'
+                  f'?academic_year={OPTIONAL_CURRENT_YEAR + 1}&conf_id=-1&division=1&sport_code=WVB'
               )
-              response = get(url)
-              html = response.text
-              (OUTPUT / f'team_list_{year}.html').write_text(html, encoding='utf-8')
-              soup = BeautifulSoup(html, 'lxml')
-              found: dict[str, str] = {}
-              for anchor in soup.find_all('a', href=True):
-                  href = str(anchor.get('href') or '')
-                  match = re.search(r'/teams/(\d+)', href)
-                  if not match:
-                      match = re.search(r'/team/(\d+)', href)
-                  if not match:
-                      continue
-                  team_id = match.group(1)
-                  name = ' '.join(anchor.get_text(' ', strip=True).split())
-                  if name and not name.isdigit():
-                      found[team_id] = name
-              data = pd.DataFrame(
-                  [{'season': year, 'team_id': k, 'team_name': v} for k, v in found.items()]
-              ).sort_values(['team_name', 'team_id']).reset_index(drop=True)
-              if len(data) < 300:
-                  raise RuntimeError(f'Only {len(data)} team IDs found for {year}: {url}')
-              data.to_csv(OUTPUT / f'team_ids_{year}.csv', index=False)
-              return data, url
-
-          def flatten_columns(columns) -> list[str]:
-              out = []
-              for col in columns:
-                  if isinstance(col, tuple):
-                      parts = [str(x).strip() for x in col if str(x).strip() and not str(x).startswith('Unnamed')]
-                      value = '_'.join(parts)
-                  else:
-                      value = str(col).strip()
-                  out.append(value or 'unnamed')
-              return out
-
-          def parse_roster(year: int, team_id: str, team_name: str) -> dict:
-              url = f'https://stats.ncaa.org/teams/{team_id}/roster'
+              page = await context.new_page()
               try:
-                  response = get(url)
-                  tables = pd.read_html(io.StringIO(response.text))
-                  selected = None
-                  for table in tables:
-                      table.columns = flatten_columns(table.columns)
-                      normalized = {re.sub(r'[^a-z]', '', c.lower()) for c in table.columns}
-                      if {'name', 'player'} & normalized:
-                          selected = table
-                          break
-                  if selected is None and tables:
-                      selected = tables[0]
-                      selected.columns = flatten_columns(selected.columns)
-                  if selected is None or selected.empty:
-                      raise RuntimeError('No nonempty roster table')
-                  selected = selected.dropna(how='all').copy()
-                  selected.insert(0, 'source_url', url)
-                  selected.insert(0, 'team_name', team_name)
-                  selected.insert(0, 'team_id', team_id)
-                  selected.insert(0, 'season', year)
-                  return {
-                      'ok': True,
-                      'season': year,
-                      'team_id': team_id,
-                      'team_name': team_name,
-                      'url': url,
-                      'rows': len(selected),
-                      'columns': list(selected.columns),
-                      'frame': selected,
-                  }
+                  response = await page.goto(url, wait_until='domcontentloaded', timeout=120_000)
+                  await page.wait_for_timeout(2500)
+                  anchors = page.locator('table a[href*="/teams/"]')
+                  count = await anchors.count()
+                  rows: dict[str, str] = {}
+                  for index in range(count):
+                      anchor = anchors.nth(index)
+                      href = await anchor.get_attribute('href') or ''
+                      match = re.search(r'/teams/(\d+)', href)
+                      name = ' '.join((await anchor.inner_text()).split())
+                      if match and name and not name.isdigit():
+                          rows[match.group(1)] = name
+                  frame = pd.DataFrame([{'season': OPTIONAL_CURRENT_YEAR, 'team_id': k, 'team_name': v} for k, v in rows.items()])
+                  if not frame.empty:
+                      frame = frame.sort_values(['team_name', 'team_id']).reset_index(drop=True)
+                      frame.to_csv(OUTPUT / f'team_ids_{OPTIONAL_CURRENT_YEAR}.csv', index=False)
+                  return frame, {'url': url, 'http_status': response.status if response else None, 'teams': len(frame), 'complete': len(frame) >= 300}
               except Exception as exc:  # noqa: BLE001
-                  return {
-                      'ok': False,
-                      'season': year,
-                      'team_id': team_id,
-                      'team_name': team_name,
-                      'url': url,
-                      'error': repr(exc),
-                  }
+                  await page.screenshot(path=str(OUTPUT / f'team_ids_{OPTIONAL_CURRENT_YEAR}_failure.png'), full_page=True)
+                  return pd.DataFrame(columns=['season', 'team_id', 'team_name']), {'url': url, 'teams': 0, 'complete': False, 'error': repr(exc)}
+              finally:
+                  await page.close()
 
-          audit = {'generated_at_utc': pd.Timestamp.utcnow().isoformat(), 'seasons': {}}
-          all_frames = []
-          for year in YEARS:
-              teams, list_url = team_list(year)
-              tasks = [tuple(row) for row in teams[['team_id', 'team_name']].itertuples(index=False, name=None)]
-              results = []
-              with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-                  futures = [pool.submit(parse_roster, year, str(team_id), str(team_name)) for team_id, team_name in tasks]
-                  for n, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-                      result = future.result()
-                      results.append(result)
-                      if n % 40 == 0 or not result['ok']:
-                          print(year, n, '/', len(futures), result.get('team_name'), 'ok' if result['ok'] else result.get('error'), flush=True)
+          async def extract_roster_table(page: Page) -> tuple[list[str], list[list[str]], str]:
+              preferred = 'table[id^="rosters_form_players_"][id$="_data_table"]'
+              try:
+                  await page.wait_for_selector(f'{preferred} tbody tr', state='attached', timeout=45_000)
+              except PlaywrightTimeoutError:
+                  await page.wait_for_timeout(2500)
+              candidates = page.locator('table')
+              n = await candidates.count()
+              for i in range(n):
+                  table = candidates.nth(i)
+                  headers = [' '.join(x.split()) for x in await table.locator('thead th').all_inner_texts()]
+                  if not headers:
+                      first = table.locator('tr').first
+                      headers = [' '.join(x.split()) for x in await first.locator('th,td').all_inner_texts()]
+                  normalized = {re.sub(r'[^a-z]', '', h.lower()) for h in headers}
+                  if not ({'name', 'player'} & normalized):
+                      continue
+                  body_rows = table.locator('tbody tr')
+                  row_count = await body_rows.count()
+                  rows: list[list[str]] = []
+                  for r in range(row_count):
+                      cells = [' '.join(x.split()) for x in await body_rows.nth(r).locator('td').all_inner_texts()]
+                      if cells and any(cells):
+                          rows.append(cells)
+                  if rows:
+                      table_id = await table.get_attribute('id') or f'table_{i}'
+                      return headers, rows, table_id
+              raise RuntimeError('No roster table with Name/Player header and body rows')
+
+          def unique_headers(headers: list[str], width: int) -> list[str]:
+              base = headers[:width] + [f'column_{i + 1}' for i in range(len(headers), width)]
+              result: list[str] = []
+              seen: dict[str, int] = {}
+              for i, value in enumerate(base):
+                  name = value.strip() or f'column_{i + 1}'
+                  seen[name] = seen.get(name, 0) + 1
+                  result.append(name if seen[name] == 1 else f'{name}_{seen[name]}')
+              return result
+
+          async def scrape_one(context: BrowserContext, semaphore: asyncio.Semaphore, year: int, team_id: str, team_name: str) -> dict[str, Any]:
+              async with semaphore:
+                  page = await context.new_page()
+                  url = f'https://stats.ncaa.org/teams/{team_id}/roster'
+                  try:
+                      last_error: Exception | None = None
+                      for attempt in range(1, 4):
+                          try:
+                              response = await page.goto(url, wait_until='domcontentloaded', timeout=120_000)
+                              await page.wait_for_timeout(700 + random.randint(0, 650))
+                              if response and response.status in {403, 429, 500, 502, 503, 504}:
+                                  raise RuntimeError(f'HTTP {response.status}')
+                              headers, rows, table_id = await extract_roster_table(page)
+                              width = max(len(row) for row in rows)
+                              columns = unique_headers(headers, width)
+                              normalized_rows = [row[:width] + [''] * (width - len(row)) for row in rows]
+                              frame = pd.DataFrame(normalized_rows, columns=columns)
+                              for name, value in reversed([
+                                  ('source_table_id', table_id),
+                                  ('source_url', url),
+                                  ('team_name', team_name),
+                                  ('team_id', team_id),
+                                  ('season', year),
+                              ]):
+                                  frame.insert(0, name, value)
+                              return {'ok': True, 'season': year, 'team_id': team_id, 'team_name': team_name, 'url': url, 'rows': len(frame), 'columns': list(frame.columns), 'frame': frame}
+                          except Exception as exc:  # noqa: BLE001
+                              last_error = exc
+                              await page.wait_for_timeout(attempt * 1800 + random.randint(0, 1000))
+                              if attempt == 2:
+                                  try:
+                                      await page.goto(f'https://stats.ncaa.org/teams/{team_id}', wait_until='domcontentloaded', timeout=90_000)
+                                      await page.wait_for_timeout(1200)
+                                  except Exception:
+                                      pass
+                      safe = re.sub(r'[^a-zA-Z0-9_-]+', '_', team_name)[:60]
+                      await page.screenshot(path=str(OUTPUT / f'failure_{year}_{team_id}_{safe}.png'), full_page=True)
+                      (OUTPUT / f'failure_{year}_{team_id}_{safe}.html').write_text(await page.content(), encoding='utf-8')
+                      return {'ok': False, 'season': year, 'team_id': team_id, 'team_name': team_name, 'url': url, 'error': repr(last_error)}
+                  finally:
+                      await page.close()
+
+          async def scrape_season(context: BrowserContext, teams: pd.DataFrame, year: int) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+              semaphore = asyncio.Semaphore(4)
+              tasks = [scrape_one(context, semaphore, year, str(r.team_id), str(r.team_name)) for r in teams.itertuples(index=False)]
+              results: list[dict[str, Any]] = []
+              for n, future in enumerate(asyncio.as_completed(tasks), start=1):
+                  item = await future
+                  results.append(item)
+                  if n % 25 == 0 or not item['ok']:
+                      print(year, n, '/', len(tasks), item['team_name'], 'ok' if item['ok'] else item.get('error'), flush=True)
               frames = [item.pop('frame') for item in results if item['ok']]
               failures = [item for item in results if not item['ok']]
               roster = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-              roster.to_csv(OUTPUT / f'ncaa_wvb_full_roster_{year}.csv', index=False)
-              pd.DataFrame(failures).to_csv(OUTPUT / f'ncaa_wvb_roster_failures_{year}.csv', index=False)
-              if len(roster) < 4_000 or len(frames) < 280:
-                  raise RuntimeError(
-                      f'Roster coverage below safety floor for {year}: rows={len(roster)}, teams={len(frames)}, failures={len(failures)}'
-                  )
-              duplicate_columns = [c for c in roster.columns if roster.columns.tolist().count(c) > 1]
-              audit['seasons'][str(year)] = {
-                  'team_list_url': list_url,
+              roster_path = OUTPUT / f'ncaa_wvb_full_roster_{year}.csv'
+              failure_path = OUTPUT / f'ncaa_wvb_roster_failures_{year}.csv'
+              roster.to_csv(roster_path, index=False)
+              pd.DataFrame(failures).to_csv(failure_path, index=False)
+              qc = {
                   'team_ids': len(teams),
                   'teams_scraped': len(frames),
                   'teams_failed': len(failures),
+                  'team_success_rate': len(frames) / max(len(teams), 1),
                   'roster_rows': len(roster),
                   'columns': list(roster.columns),
-                  'duplicate_columns': sorted(set(duplicate_columns)),
-                  'csv_sha256': hashlib.sha256((OUTPUT / f'ncaa_wvb_full_roster_{year}.csv').read_bytes()).hexdigest(),
+                  'csv_sha256': sha256(roster_path),
+                  'historical_safety_floor_pass': (len(frames) >= 300 and len(roster) >= 4000) if year in HISTORICAL_YEARS else None,
               }
-              all_frames.append(roster)
-          combined = pd.concat(all_frames, ignore_index=True, sort=False)
-          combined.to_csv(OUTPUT / 'ncaa_wvb_full_rosters_2023_2026.csv', index=False)
-          audit['combined_rows'] = len(combined)
-          audit['combined_teams_by_season'] = combined.groupby('season')['team_id'].nunique().astype(int).to_dict()
-          audit['combined_sha256'] = hashlib.sha256((OUTPUT / 'ncaa_wvb_full_rosters_2023_2026.csv').read_bytes()).hexdigest()
-          (OUTPUT / 'roster_scrape_audit.json').write_text(json.dumps(audit, indent=2, default=str) + '\n', encoding='utf-8')
-          print(json.dumps(audit, indent=2, default=str), flush=True)
+              return roster, failures, qc
+
+          async def main() -> None:
+              audit: dict[str, Any] = {'generated_at_utc': pd.Timestamp.now('UTC').isoformat(), 'seasons': {}}
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(
+                      headless=True,
+                      args=['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox'],
+                  )
+                  context = await browser.new_context(
+                      user_agent=USER_AGENT,
+                      locale='en-US',
+                      timezone_id='America/New_York',
+                      viewport={'width': 1440, 'height': 1100},
+                      extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+                  )
+                  await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                  try:
+                      team_sets, source_audit = await load_team_ids(context)
+                      audit['team_id_sources'] = source_audit
+                      current, current_audit = await discover_current_team_ids(context)
+                      audit['current_team_id_discovery'] = current_audit
+                      if len(current) >= 300:
+                          team_sets[OPTIONAL_CURRENT_YEAR] = current
+                      all_frames = []
+                      for year in sorted(team_sets):
+                          roster, failures, qc = await scrape_season(context, team_sets[year], year)
+                          audit['seasons'][str(year)] = qc
+                          all_frames.append(roster)
+                      combined = pd.concat(all_frames, ignore_index=True, sort=False) if all_frames else pd.DataFrame()
+                      combined_path = OUTPUT / 'ncaa_wvb_full_rosters_combined.csv'
+                      combined.to_csv(combined_path, index=False)
+                      audit['combined_rows'] = len(combined)
+                      audit['combined_seasons'] = sorted(pd.to_numeric(combined.get('season'), errors='coerce').dropna().astype(int).unique().tolist()) if not combined.empty else []
+                      audit['combined_sha256'] = sha256(combined_path)
+                  finally:
+                      await context.close()
+                      await browser.close()
+              historical_pass = all(audit['seasons'].get(str(y), {}).get('historical_safety_floor_pass') for y in HISTORICAL_YEARS)
+              audit['historical_materialization_pass'] = bool(historical_pass)
+              (OUTPUT / 'roster_scrape_audit.json').write_text(json.dumps(audit, indent=2, default=str) + '\n', encoding='utf-8')
+              print(json.dumps(audit, indent=2, default=str), flush=True)
+              if not historical_pass:
+                  raise SystemExit('Historical roster materialization failed safety floors; artifact retained for diagnosis')
+
+          if __name__ == '__main__':
+              asyncio.run(main())
           PY
           python roster_scrape.py
 
@@ -207,6 +303,6 @@ jobs:
         with:
           name: NCAA_WVB_FULL_ROSTERS_2023_2026
           path: rosters/**
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
           compression-level: 6
