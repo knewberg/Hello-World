@@ -1,0 +1,90 @@
+name: NCAA WVB national player projection backtest 20260908
+
+on:
+  push:
+    branches:
+      - volleyball-player-backtest-20260908
+    paths:
+      - '.github/workflows/ncaa-wvb-national-backtest-20260908.yml'
+      - 'volleyball_backtest2/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Reconstruct source payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat volleyball_backtest2/payload.* > payload.b64
+          echo '2859d09c2614c1a242b9586e774a506c816941739f743c0c46b12390d2f7cb74  payload.b64' | sha256sum -c -
+          base64 -d payload.b64 > payload.tar.gz
+          echo '0c89f253d0316c1074e4386ff9f3fadf5523e9b21b7d2121c31081bf20e77c67  payload.tar.gz' | sha256sum -c -
+          mkdir -p payload
+          tar -xzf payload.tar.gz -C payload
+
+      - name: Reconstruct test payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat volleyball_backtest2/tests.* > tests.b64
+          echo '7f1fb350ca6069f2f02215defdf10dbc0ce4f1cd508013245729626492132ee8  tests.b64' | sha256sum -c -
+          base64 -d tests.b64 > tests.tar.gz
+          echo '0086f5800338a5bb950a9bcfa3f3e42d41a3f5ae7cb3120f1dba6ad956d87dcc  tests.tar.gz' | sha256sum -c -
+          tar -xzf tests.tar.gz -C payload
+
+      - name: Install dependencies and package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas numpy scipy scikit-learn joblib requests pytest pytest-cov
+          python -m pip install -e ./payload
+
+      - name: Compile and run package tests
+        run: |
+          python -m compileall -q payload/src payload/ncaa_wvb_national_backtest_20260908.py
+          pytest -q payload/tests --disable-warnings --maxfail=1
+
+      - name: Run national chronological M0-M4 backtest
+        env:
+          PYTHONHASHSEED: '0'
+        run: |
+          python payload/ncaa_wvb_national_backtest_20260908.py \
+            --output-root "$GITHUB_WORKSPACE/NCAA_WVB_NATIONAL_BACKTEST_20260908"
+
+      - name: Show execution status
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort
+          if [ -f "$GITHUB_WORKSPACE/NCAA_WVB_NATIONAL_BACKTEST_20260908/RUN_STATUS.json" ]; then
+            cat "$GITHUB_WORKSPACE/NCAA_WVB_NATIONAL_BACKTEST_20260908/RUN_STATUS.json"
+          fi
+          if [ -f "$GITHUB_WORKSPACE/NCAA_WVB_NATIONAL_BACKTEST_20260908/COMPLETED.json" ]; then
+            cat "$GITHUB_WORKSPACE/NCAA_WVB_NATIONAL_BACKTEST_20260908/COMPLETED.json"
+          fi
+
+      - name: Upload backtest artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NCAA_WVB_NATIONAL_BACKTEST_20260908
+          path: |
+            NCAA_WVB_NATIONAL_BACKTEST_20260908/**
+            NCAA_WVB_NATIONAL_BACKTEST_20260908*.zip
+          if-no-files-found: warn
+          retention-days: 30
