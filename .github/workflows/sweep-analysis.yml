@@ -6,7 +6,7 @@ on:
     branches:
       - sweep-analysis-2023-2025
     paths:
-      - analysis/sweep_analysis.py.gz.b64
+      - analysis/sweep_parts/**
       - .github/workflows/sweep-analysis.yml
 
 permissions:
@@ -27,9 +27,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Restore analysis script
+      - name: Restore and validate analysis script
         run: |
-          base64 --decode analysis/sweep_analysis.py.gz.b64 | gzip --decompress > analysis/sweep_analysis.py
+          cat analysis/sweep_parts/part_* > /tmp/sweep_analysis.py.gz.b64
+          test "$(wc -c < /tmp/sweep_analysis.py.gz.b64)" -eq 22920
+          base64 --decode /tmp/sweep_analysis.py.gz.b64 | gzip --decompress > analysis/sweep_analysis.py
+          test "$(wc -c < analysis/sweep_analysis.py)" -eq 63910
           python -m py_compile analysis/sweep_analysis.py
 
       - name: Install analytical dependencies
