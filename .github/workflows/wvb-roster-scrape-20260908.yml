@@ -1,0 +1,212 @@
+name: NCAA WVB full roster materialization
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/wvb-roster-scrape-20260908.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rosters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install parser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas requests beautifulsoup4 lxml
+
+      - name: Materialize official NCAA Division I women's volleyball rosters
+        shell: bash
+        run: |
+          cat > roster_scrape.py <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import io
+          import json
+          import random
+          import re
+          import threading
+          import time
+          from pathlib import Path
+
+          import pandas as pd
+          import requests
+          from bs4 import BeautifulSoup
+
+          YEARS = (2023, 2024, 2025, 2026)
+          OUTPUT = Path('rosters')
+          OUTPUT.mkdir(parents=True, exist_ok=True)
+          USER_AGENT = (
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/126 Safari/537.36 '
+              'NCAA-WVB-research/1.0'
+          )
+          local = threading.local()
+
+          def session() -> requests.Session:
+              if not hasattr(local, 'session'):
+                  s = requests.Session()
+                  s.headers.update({'User-Agent': USER_AGENT, 'Accept': 'text/html,application/xhtml+xml'})
+                  local.session = s
+              return local.session
+
+          def get(url: str, attempts: int = 6) -> requests.Response:
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session().get(url, timeout=(30, 90), allow_redirects=True)
+                      if response.status_code == 200 and len(response.content) > 100:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}, {len(response.content)} bytes')
+                  except Exception as exc:  # noqa: BLE001
+                      last = exc
+                  time.sleep(min(2 ** attempt, 25) + random.random())
+              raise RuntimeError(f'GET failed after {attempts} attempts: {url}: {last}')
+
+          def team_list(year: int) -> tuple[pd.DataFrame, str]:
+              url = (
+                  'https://stats.ncaa.org/team/inst_team_list'
+                  f'?academic_year={year + 1}&conf_id=-1&division=1&sport_code=WVB'
+              )
+              response = get(url)
+              html = response.text
+              (OUTPUT / f'team_list_{year}.html').write_text(html, encoding='utf-8')
+              soup = BeautifulSoup(html, 'lxml')
+              found: dict[str, str] = {}
+              for anchor in soup.find_all('a', href=True):
+                  href = str(anchor.get('href') or '')
+                  match = re.search(r'/teams/(\d+)', href)
+                  if not match:
+                      match = re.search(r'/team/(\d+)', href)
+                  if not match:
+                      continue
+                  team_id = match.group(1)
+                  name = ' '.join(anchor.get_text(' ', strip=True).split())
+                  if name and not name.isdigit():
+                      found[team_id] = name
+              data = pd.DataFrame(
+                  [{'season': year, 'team_id': k, 'team_name': v} for k, v in found.items()]
+              ).sort_values(['team_name', 'team_id']).reset_index(drop=True)
+              if len(data) < 300:
+                  raise RuntimeError(f'Only {len(data)} team IDs found for {year}: {url}')
+              data.to_csv(OUTPUT / f'team_ids_{year}.csv', index=False)
+              return data, url
+
+          def flatten_columns(columns) -> list[str]:
+              out = []
+              for col in columns:
+                  if isinstance(col, tuple):
+                      parts = [str(x).strip() for x in col if str(x).strip() and not str(x).startswith('Unnamed')]
+                      value = '_'.join(parts)
+                  else:
+                      value = str(col).strip()
+                  out.append(value or 'unnamed')
+              return out
+
+          def parse_roster(year: int, team_id: str, team_name: str) -> dict:
+              url = f'https://stats.ncaa.org/teams/{team_id}/roster'
+              try:
+                  response = get(url)
+                  tables = pd.read_html(io.StringIO(response.text))
+                  selected = None
+                  for table in tables:
+                      table.columns = flatten_columns(table.columns)
+                      normalized = {re.sub(r'[^a-z]', '', c.lower()) for c in table.columns}
+                      if {'name', 'player'} & normalized:
+                          selected = table
+                          break
+                  if selected is None and tables:
+                      selected = tables[0]
+                      selected.columns = flatten_columns(selected.columns)
+                  if selected is None or selected.empty:
+                      raise RuntimeError('No nonempty roster table')
+                  selected = selected.dropna(how='all').copy()
+                  selected.insert(0, 'source_url', url)
+                  selected.insert(0, 'team_name', team_name)
+                  selected.insert(0, 'team_id', team_id)
+                  selected.insert(0, 'season', year)
+                  return {
+                      'ok': True,
+                      'season': year,
+                      'team_id': team_id,
+                      'team_name': team_name,
+                      'url': url,
+                      'rows': len(selected),
+                      'columns': list(selected.columns),
+                      'frame': selected,
+                  }
+              except Exception as exc:  # noqa: BLE001
+                  return {
+                      'ok': False,
+                      'season': year,
+                      'team_id': team_id,
+                      'team_name': team_name,
+                      'url': url,
+                      'error': repr(exc),
+                  }
+
+          audit = {'generated_at_utc': pd.Timestamp.utcnow().isoformat(), 'seasons': {}}
+          all_frames = []
+          for year in YEARS:
+              teams, list_url = team_list(year)
+              tasks = [tuple(row) for row in teams[['team_id', 'team_name']].itertuples(index=False, name=None)]
+              results = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                  futures = [pool.submit(parse_roster, year, str(team_id), str(team_name)) for team_id, team_name in tasks]
+                  for n, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+                      result = future.result()
+                      results.append(result)
+                      if n % 40 == 0 or not result['ok']:
+                          print(year, n, '/', len(futures), result.get('team_name'), 'ok' if result['ok'] else result.get('error'), flush=True)
+              frames = [item.pop('frame') for item in results if item['ok']]
+              failures = [item for item in results if not item['ok']]
+              roster = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+              roster.to_csv(OUTPUT / f'ncaa_wvb_full_roster_{year}.csv', index=False)
+              pd.DataFrame(failures).to_csv(OUTPUT / f'ncaa_wvb_roster_failures_{year}.csv', index=False)
+              if len(roster) < 4_000 or len(frames) < 280:
+                  raise RuntimeError(
+                      f'Roster coverage below safety floor for {year}: rows={len(roster)}, teams={len(frames)}, failures={len(failures)}'
+                  )
+              duplicate_columns = [c for c in roster.columns if roster.columns.tolist().count(c) > 1]
+              audit['seasons'][str(year)] = {
+                  'team_list_url': list_url,
+                  'team_ids': len(teams),
+                  'teams_scraped': len(frames),
+                  'teams_failed': len(failures),
+                  'roster_rows': len(roster),
+                  'columns': list(roster.columns),
+                  'duplicate_columns': sorted(set(duplicate_columns)),
+                  'csv_sha256': hashlib.sha256((OUTPUT / f'ncaa_wvb_full_roster_{year}.csv').read_bytes()).hexdigest(),
+              }
+              all_frames.append(roster)
+          combined = pd.concat(all_frames, ignore_index=True, sort=False)
+          combined.to_csv(OUTPUT / 'ncaa_wvb_full_rosters_2023_2026.csv', index=False)
+          audit['combined_rows'] = len(combined)
+          audit['combined_teams_by_season'] = combined.groupby('season')['team_id'].nunique().astype(int).to_dict()
+          audit['combined_sha256'] = hashlib.sha256((OUTPUT / 'ncaa_wvb_full_rosters_2023_2026.csv').read_bytes()).hexdigest()
+          (OUTPUT / 'roster_scrape_audit.json').write_text(json.dumps(audit, indent=2, default=str) + '\n', encoding='utf-8')
+          print(json.dumps(audit, indent=2, default=str), flush=True)
+          PY
+          python roster_scrape.py
+
+      - name: Upload roster archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NCAA_WVB_FULL_ROSTERS_2023_2026
+          path: rosters/**
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
