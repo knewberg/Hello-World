@@ -1,0 +1,38 @@
+name: NCAA Volleyball Fixed Player Sweep Analysis
+on:
+  workflow_dispatch:
+  push:
+    branches: [sweep-analysis-2023-2025]
+    paths:
+      - run_fixed_player_analysis.py
+      - .github/workflows/fixed-player-sweep-analysis.yml
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sweep-analysis-2023-2025
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pandas numpy scipy scikit-learn statsmodels matplotlib
+      - run: python run_fixed_player_analysis.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixed-player-sweep-analysis
+          path: sweep_output_fixed/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Commit outputs
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add sweep_output_fixed
+          git diff --cached --quiet || git commit -m 'Add corrected player sweep analysis [skip ci]'
+          git pull --rebase origin sweep-analysis-2023-2025
+          git push origin HEAD:sweep-analysis-2023-2025
