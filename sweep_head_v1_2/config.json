@@ -1,0 +1,25 @@
+{
+  "version": "sweep-head-v1.2-regularized-intercept",
+  "match_win_probability_source": "locked 35/25/20/10/10 model",
+  "winner_model_change": false,
+  "penalty_lambda": 5.0,
+  "same_day_policy": "freeze one calibration state for all matches on a date; update only after that date is complete",
+  "online_parameters": [
+    "favorite_sweep_intercept",
+    "underdog_sweep_intercept_when_upset_wins_exist"
+  ],
+  "frozen_parameters": [
+    "favorite_31_vs_32",
+    "underdog_31_vs_32",
+    "all_slopes"
+  ],
+  "set_shape_residual_weight": 0.0,
+  "player_residual_weight": 0.0,
+  "current_2026_state": {
+    "fitted_through_date": "2026-09-07",
+    "favorite_win_observations": 12,
+    "upset_win_observations": 0,
+    "favorite_sweep_delta": -0.20340621161358413,
+    "underdog_sweep_delta": 0.0
+  }
+}
