@@ -1,0 +1,33 @@
+name: NCAA WVB roster compatibility probe
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/wvb-roster-probe.yml'
+      - 'scripts/wvb_roster_probe.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - run: python scripts/wvb_roster_probe.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NCAA_WVB_ROSTER_COMPATIBILITY_PROBE
+          path: roster_probe/**
+          if-no-files-found: warn
+          retention-days: 7
